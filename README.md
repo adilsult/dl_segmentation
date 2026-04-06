@@ -17,13 +17,46 @@ The pipeline takes 4 MRI modalities (T1, T1ce, T2, FLAIR) as input and outputs a
 
 ## Quick Start
 
+### macOS / Linux
+
 ```bash
 git clone https://github.com/adilsult/dl_segmentation.git
 cd dl_segmentation
+python3 -m venv .venv
+source .venv/bin/activate
 pip install torch nibabel numpy matplotlib scikit-learn
 ```
 
-Open `DLmidtermproject.ipynb` in Jupyter (or VS Code) and press **Run All**.
+### Windows (Command Prompt)
+
+```cmd
+git clone https://github.com/adilsult/dl_segmentation.git
+cd dl_segmentation
+python -m venv .venv
+.venv\Scripts\activate
+pip install torch nibabel numpy matplotlib scikit-learn
+```
+
+### Windows (PowerShell)
+
+```powershell
+git clone https://github.com/adilsult/dl_segmentation.git
+cd dl_segmentation
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+pip install torch nibabel numpy matplotlib scikit-learn
+```
+
+> **Note:** On Windows, if you get a PowerShell execution policy error, run `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` first.
+
+### Run the notebook
+
+Open `DLmidtermproject.ipynb` in Jupyter or VS Code and press **Run All**.
+
+```bash
+pip install jupyter
+jupyter notebook DLmidtermproject.ipynb
+```
 
 All datasets, checkpoints, and training histories are included in the repository — no external downloads needed.
 
