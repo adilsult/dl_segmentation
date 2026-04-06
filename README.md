@@ -15,39 +15,62 @@ The pipeline takes 4 MRI modalities (T1, T1ce, T2, FLAIR) as input and outputs a
 | HybridUNet2D | DiceBCE | 2,836,629 | 0.9574 | 0.9183 |
 | HybridUNet2D | FocalTversky | 2,836,629 | 0.9167 | 0.8462 |
 
+## Prerequisites
+
+Install these before starting (skip any you already have):
+
+| Tool | How to install |
+|------|---------------|
+| **Python 3.9+** | [python.org/downloads](https://www.python.org/downloads/) — check "Add Python to PATH" during install |
+| **Git** | [git-scm.com/downloads](https://git-scm.com/downloads) — needed to clone the repo |
+| **Jupyter** *(optional)* | Installed automatically below, or use VS Code with the Python extension |
+
+To verify they are installed, open a terminal and run:
+```
+python --version
+git --version
+```
+
 ## Quick Start
 
-### macOS / Linux
+### Option 1: macOS / Linux (Terminal)
 
 ```bash
 git clone https://github.com/adilsult/dl_segmentation.git
 cd dl_segmentation
 python3 -m venv .venv
 source .venv/bin/activate
-pip install torch nibabel numpy matplotlib scikit-learn
+pip install torch nibabel numpy matplotlib scikit-learn jupyter
+jupyter notebook DLmidtermproject.ipynb
 ```
 
-### Windows (Command Prompt)
+### Option 2: Windows (Command Prompt)
 
 ```cmd
 git clone https://github.com/adilsult/dl_segmentation.git
 cd dl_segmentation
 python -m venv .venv
 .venv\Scripts\activate
-pip install torch nibabel numpy matplotlib scikit-learn
+pip install torch nibabel numpy matplotlib scikit-learn jupyter
+jupyter notebook DLmidtermproject.ipynb
 ```
 
-### Windows (PowerShell)
+### Option 3: Windows (PowerShell)
 
 ```powershell
 git clone https://github.com/adilsult/dl_segmentation.git
 cd dl_segmentation
 python -m venv .venv
 .venv\Scripts\Activate.ps1
-pip install torch nibabel numpy matplotlib scikit-learn
+pip install torch nibabel numpy matplotlib scikit-learn jupyter
+jupyter notebook DLmidtermproject.ipynb
 ```
 
-> **Note:** On Windows, if you get a PowerShell execution policy error, run `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` first.
+> **Note:** On Windows PowerShell, if you get an execution policy error, run `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned` first.
+
+### Option 4: No install — download ZIP
+
+If you don't have Git, go to [github.com/adilsult/dl_segmentation](https://github.com/adilsult/dl_segmentation), click the green **Code** button → **Download ZIP**, extract it, then follow the steps above starting from `cd dl_segmentation`.
 
 ### Run the notebook
 
