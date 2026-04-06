@@ -12,8 +12,8 @@ import torch
 from data import build_dataset_from_cases, discover_case_paths
 from dataset import BraTS2DSliceDataset, make_loaders
 from eval import evaluate
-from losses import DiceBCELoss
-from model import UNet2D
+from losses import DiceBCELoss, FocalTverskyLoss
+from model import UNet2D, AttentionUNet2D, HybridUNet2D
 
 
 def set_seed(seed: int = 42) -> None:
@@ -66,6 +66,29 @@ def split_case_paths(case_paths: Sequence[Path], val_ratio: float, seed: int) ->
     train_cases = paths[:n_train]
     val_cases = paths[n_train:]
     return train_cases, val_cases
+
+
+def build_model(args: argparse.Namespace) -> torch.nn.Module:
+    """Factory: create model based on --model-type CLI arg."""
+    kwargs = dict(in_channels=4, out_channels=1, base_channels=args.base_channels)
+    if args.model_type == "unet":
+        return UNet2D(**kwargs)
+    elif args.model_type == "attention_unet":
+        return AttentionUNet2D(**kwargs)
+    elif args.model_type == "hybrid":
+        return HybridUNet2D(**kwargs)
+    else:
+        raise ValueError(f"Unknown model type: {args.model_type}")
+
+
+def build_loss(args: argparse.Namespace) -> torch.nn.Module:
+    """Factory: create loss function based on --loss CLI arg."""
+    if args.loss == "dicebce":
+        return DiceBCELoss(dice_weight=args.dice_weight, bce_weight=args.bce_weight)
+    elif args.loss == "focal_tversky":
+        return FocalTverskyLoss(alpha=args.ft_alpha, beta=args.ft_beta, gamma=args.ft_gamma)
+    else:
+        raise ValueError(f"Unknown loss: {args.loss}")
 
 
 def run_training(args: argparse.Namespace) -> Dict[str, List[float]]:
@@ -134,9 +157,11 @@ def run_training(args: argparse.Namespace) -> Dict[str, List[float]]:
         train_loader = torch.utils.data.DataLoader(subset, batch_size=args.batch_size, shuffle=True)
         print(f"Tiny overfit mode enabled with {subset_n} samples")
 
-    model = UNet2D(in_channels=4, out_channels=1, base_channels=args.base_channels).to(device)
+    model = build_model(args).to(device)
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"Model: {args.model_type} | Loss: {args.loss} | Params: {n_params:,}")
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    loss_fn = DiceBCELoss(dice_weight=args.dice_weight, bce_weight=args.bce_weight)
+    loss_fn = build_loss(args)
 
     history: Dict[str, List[float]] = {"train_loss": [], "val_dice": [], "val_iou": [], "val_precision": [], "val_recall": []}
     best_dice = -1.0
@@ -208,6 +233,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-5)
     parser.add_argument("--base-channels", type=int, default=16)
+    parser.add_argument("--model-type", type=str, default="unet",
+                        choices=["unet", "attention_unet", "hybrid"],
+                        help="Model architecture.")
+    parser.add_argument("--loss", type=str, default="dicebce",
+                        choices=["dicebce", "focal_tversky"],
+                        help="Loss function.")
+    parser.add_argument("--ft-alpha", type=float, default=0.7, help="Focal Tversky alpha (FP weight).")
+    parser.add_argument("--ft-beta", type=float, default=0.3, help="Focal Tversky beta (FN weight).")
+    parser.add_argument("--ft-gamma", type=float, default=0.75, help="Focal Tversky gamma (focal exponent).")
     parser.add_argument("--dice-weight", type=float, default=0.5)
     parser.add_argument("--bce-weight", type=float, default=0.5)
     parser.add_argument("--seed", type=int, default=42)
