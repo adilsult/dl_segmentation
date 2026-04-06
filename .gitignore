@@ -1,0 +1,34 @@
+# Virtual environment
+.venv/
+
+# Cached extracted data
+.cache/
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+
+# BraTS dataset files (too large for GitHub, downloaded via gdown)
+*.tar
+
+# Model checkpoints (too large for GitHub, downloaded via gdown)
+runs/*/best.pt
+runs/*/latest.pt
+
+# PPTX build artifacts
+pptx_unpacked/
+
+# Presentation
+*.pptx
+
+# Personal docs and markdown (not for repo)
+CLAUDE.md
+UPDATES.md
+instructions.md
+Project_Proposal.docx
+
+# Drive sync folder (duplicate)
+mri project updates/
