@@ -74,6 +74,6 @@ Combined Dice Loss + Binary Cross-Entropy with equal weights (0.5 / 0.5), provid
 
 ## Team
 
-Adilsultan Khairolla, Kavyashree Markuli Vijaykumar, Reda
+Adilsultan Khairolla, Kavyashree Markuli Vijaykumar
 
 AI700-001_BK — Spring 2026
