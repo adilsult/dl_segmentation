@@ -11,12 +11,16 @@
 __pycache__/
 *.pyc
 
-# BraTS dataset files (too large for GitHub, downloaded via gdown)
-*.tar
-
-# Model checkpoints (too large for GitHub, downloaded via gdown)
-runs/*/best.pt
+# Model checkpoints — only keep best.pt, skip latest.pt
 runs/*/latest.pt
+
+# Experimental runs not used by the notebook
+runs/tiny_overfit/
+runs/baseline_2d/
+runs/baseline_2d_stepnext/
+runs/dir_mode_check/
+runs/es_check/
+runs/two_cases_e30/
 
 # PPTX build artifacts
 pptx_unpacked/

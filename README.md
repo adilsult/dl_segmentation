@@ -1,79 +1,79 @@
 # MRI Brain Tumor Segmentation Using 2D U-Net
 
-Binary brain tumor segmentation from multi-modal MRI scans using a 2D U-Net baseline trained on the [BraTS 2021](https://www.synapse.org/#!Synapse:syn27046444/wiki/616571) dataset.
+Binary brain tumor segmentation from multi-modal MRI scans using 2D U-Net variants trained on the [BraTS 2021](https://www.synapse.org/#!Synapse:syn27046444/wiki/616571) dataset.
 
 ## Overview
 
 The pipeline takes 4 MRI modalities (T1, T1ce, T2, FLAIR) as input and outputs a binary tumor segmentation mask. Each 3D volume is processed as 2D axial slices, producing input tensors of shape `(N, 4, 240, 240)`.
 
-**Current results (2-patient baseline):**
+**Model comparison (2 patients, 133 slices, 30 epochs):**
 
-| Metric | Value |
-|--------|-------|
-| Val Dice | 0.9546 |
-| Val IoU | 0.9132 |
-| Train Loss | 0.75 → 0.11 |
+| Model | Loss | Params | Best Dice | Best IoU |
+|-------|------|--------|-----------|----------|
+| UNet2D | DiceBCE | 486,913 | **0.9608** | **0.9246** |
+| AttentionUNet2D | DiceBCE | 498,341 | 0.9584 | 0.9201 |
+| HybridUNet2D | DiceBCE | 2,836,629 | 0.9574 | 0.9183 |
+| HybridUNet2D | FocalTversky | 2,836,629 | 0.9167 | 0.8462 |
+
+## Quick Start
+
+```bash
+git clone https://github.com/adilsult/dl_segmentation.git
+cd dl_segmentation
+pip install torch nibabel numpy matplotlib scikit-learn
+```
+
+Open `DLmidtermproject.ipynb` in Jupyter (or VS Code) and press **Run All**.
+
+All datasets, checkpoints, and training histories are included in the repository — no external downloads needed.
 
 ## Project Structure
 
 ```
-├── data.py          # Data loading, normalization, slice extraction
-├── dataset.py       # PyTorch Dataset and DataLoader utilities
-├── model.py         # 2D U-Net architecture
-├── losses.py        # Dice + BCE combined loss
-├── eval.py          # Evaluation metrics (Dice, IoU, Precision, Recall)
-├── train.py         # Training loop with early stopping
-├── DLmidtermproject.ipynb  # Main notebook (works locally and in Google Colab)
-└── runs/            # Training artifacts (history.json files)
+├── data.py                   # Data loading, normalization, slice extraction
+├── dataset.py                # PyTorch Dataset and DataLoader utilities
+├── model.py                  # UNet2D, AttentionUNet2D, HybridUNet2D
+├── losses.py                 # DiceBCELoss, FocalTverskyLoss
+├── eval.py                   # Evaluation metrics (Dice, IoU, Precision, Recall)
+├── train.py                  # CLI training loop with early stopping
+├── compare_models.py         # Multi-model comparison script
+├── BraTS2021_00495.tar       # BraTS case 1 (~10 MB)
+├── BraTS2021_00621.tar       # BraTS case 2 (~10 MB)
+├── DLmidtermproject.ipynb    # Main notebook — Run All to reproduce results
+└── runs/                     # Pre-trained results
+    ├── baseline_2d_e20/      # 20-epoch UNet2D baseline (history + checkpoint)
+    ├── unet_dicebce/         # UNet2D + DiceBCE (history + checkpoint)
+    ├── attn_dicebce/         # AttentionUNet2D + DiceBCE (history + checkpoint)
+    ├── hybrid_dicebce/       # HybridUNet2D + DiceBCE (history only)
+    └── hybrid_focal_tversky/ # HybridUNet2D + FocalTversky (history only)
 ```
 
-## Quick Start
+## Model Architectures
 
-### Google Colab (recommended)
+- **UNet2D**: Standard encoder-decoder with skip connections (4 down/up blocks, base 16 channels)
+- **AttentionUNet2D**: Adds learned attention gates on each skip connection to focus on tumor regions
+- **HybridUNet2D**: Combines a Transformer bottleneck (2-layer, 4-head self-attention at 15x15 resolution) with attention-gated skip connections
 
-Open `DLmidtermproject.ipynb` in Google Colab and press **Run All**. The notebook automatically downloads all required files (dataset, checkpoints) via `gdown` — no setup needed.
+## Loss Functions
 
-### Local Setup
+- **DiceBCELoss**: 0.5 × Dice Loss + 0.5 × BCE — combines region-based and pixel-level supervision
+- **FocalTverskyLoss**: Tversky Index with focal modulation (alpha=0.7, beta=0.3, gamma=0.75) — penalizes missed tumor pixels more heavily
 
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install torch nibabel numpy matplotlib
-```
-
-Place BraTS `.tar` case files in the project directory, then run:
+## CLI Training
 
 ```bash
-# Train on a single case
-python train.py --epochs 20 --batch-size 4 --cpu \
-  --case-path BraTS2021_00495.tar \
-  --early-stopping-patience 5 \
-  --output-dir runs/baseline
-
-# Train on multiple cases (place .tar files in a folder)
+# Single model
 python train.py --epochs 30 --batch-size 4 --cpu \
-  --case-path /path/to/cases/ \
-  --val-ratio 0.2 \
-  --early-stopping-patience 8 \
-  --output-dir runs/multicase
+  --model-type attention_unet --loss dicebce \
+  --case-path BraTS2021_00495.tar \
+  --output-dir runs/my_run
+
+# All 4 configurations
+python compare_models.py
 ```
-
-## Model Architecture
-
-2D U-Net with encoder-decoder structure and skip connections:
-
-- **Input:** 4 channels (T1, T1ce, T2, FLAIR), 240x240
-- **Encoder:** 4 downsampling blocks (Conv3x3 + BN + ReLU + MaxPool)
-- **Bottleneck:** 256 channels
-- **Decoder:** 4 upsampling blocks (ConvTranspose + skip connection + Conv3x3)
-- **Output:** 1 channel, sigmoid activation, binary mask
-
-## Loss Function
-
-Combined Dice Loss + Binary Cross-Entropy with equal weights (0.5 / 0.5), providing both region-based and pixel-level gradient signals.
 
 ## Team
 
-Adilsultan Khairolla, Kavyashree Markuli Vijaykumar
+Adilsultan Khairolla, Kavyashree M.V., Reda
 
 AI700-001_BK — Spring 2026
