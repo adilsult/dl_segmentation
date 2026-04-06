@@ -116,7 +116,6 @@ class Up(nn.Module):
 class AttentionGate(nn.Module):
     """Soft spatial attention gate applied to encoder skip connections.
 
-    How it works:
     1. Project the gating signal g (from decoder, semantically rich) via W_g
     2. Project the skip features x (from encoder, spatially detailed) via W_x
     3. Both projections have the same spatial size after upsampling g
