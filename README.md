@@ -74,6 +74,5 @@ python compare_models.py
 
 ## Team
 
-Adilsultan Khairolla, Kavyashree M.V., Reda
-
+Adilsultan Khairolla, Kavyashree M.V.
 AI700-001_BK — Spring 2026
