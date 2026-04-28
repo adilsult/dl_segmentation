@@ -2,16 +2,32 @@ from __future__ import annotations
 
 # data.py — BraTS data loading, normalization, and 2D slice extraction
 #
-# This module handles everything related to raw data:
-# - Discovering BraTS case files (.tar archives or directories)
-# - Extracting and loading the 4 MRI modalities (T1, T1ce, T2, FLAIR) from NIfTI files
-# - Z-score normalization per modality per volume
-# - Converting multi-class segmentation labels to a single binary tumor mask
-# - Filtering and extracting 2D axial slices that contain tumor
+# Supports two dataset formats:
+#
+#   BraTS 2021 (.tar, one case per archive):
+#     BraTS2021_00495/
+#       ├── *_t1.nii.gz
+#       ├── *_t1ce.nii.gz
+#       ├── *_t2.nii.gz
+#       ├── *_flair.nii.gz
+#       └── *_seg.nii.gz          ← mask co-located with modalities
+#
+#   BraTS 2024 GLI (.tar.gz, multiple cases per archive):
+#     data/
+#       └── BraTS-GLI-00001-000/
+#             ├── *-t1c.nii.gz
+#             ├── *-t1n.nii.gz
+#             ├── *-t2w.nii.gz
+#             └── *-t2f.nii.gz
+#     labels/
+#       └── BraTS-GLI-00001-000-seg.nii.gz   ← mask in separate folder
+#
+# The BraTS 2024 format is normalised on extraction: the seg file is copied
+# into each case directory so all downstream code stays format-agnostic.
 #
 # Output shape: X = (N, 4, 240, 240), y = (N, 1, 240, 240)
-# where N = number of selected slices across all cases
 
+import shutil
 import tarfile
 from pathlib import Path
 from typing import Dict, Iterable, List, Sequence, Tuple
@@ -20,16 +36,67 @@ import nibabel as nib
 import numpy as np
 
 
-# BraTS 2021 uses different file naming conventions across cases/years.
-# This lookup table maps each modality to all possible filename suffixes
-# so the loader works regardless of the exact naming convention used.
+# BraTS naming varies across years. This table maps each modality to all
+# known suffixes so the loader works with both BraTS 2021 and 2024.
 MODALITY_ALIASES = {
-    "t1":    ("_t1.nii.gz",   "_t1n.nii.gz",  "-t1.nii.gz",   "-t1n.nii.gz"),
-    "t1ce":  ("_t1ce.nii.gz", "_t1c.nii.gz",  "-t1ce.nii.gz", "-t1c.nii.gz"),
-    "t2":    ("_t2.nii.gz",   "_t2w.nii.gz",  "-t2.nii.gz",   "-t2w.nii.gz"),
-    "flair": ("_flair.nii.gz","_t2f.nii.gz",  "-flair.nii.gz","-t2f.nii.gz"),
-    "seg":   ("_seg.nii.gz",  "-seg.nii.gz"),
+    "t1":    ("_t1.nii.gz",    "_t1n.nii.gz",  "-t1.nii.gz",   "-t1n.nii.gz"),
+    "t1ce":  ("_t1ce.nii.gz",  "_t1c.nii.gz",  "-t1ce.nii.gz", "-t1c.nii.gz"),
+    "t2":    ("_t2.nii.gz",    "_t2w.nii.gz",  "-t2.nii.gz",   "-t2w.nii.gz"),
+    "flair": ("_flair.nii.gz", "_t2f.nii.gz",  "-flair.nii.gz","-t2f.nii.gz"),
+    "seg":   ("_seg.nii.gz",   "-seg.nii.gz"),
 }
+
+
+# ---------------------------------------------------------------------------
+# Archive extraction helpers
+# ---------------------------------------------------------------------------
+
+def _is_brats2024_root(path: Path) -> bool:
+    """Return True if path is a BraTS 2024 GLI root (has data/ and labels/ subdirs)."""
+    return (path / "data").is_dir() and (path / "labels").is_dir()
+
+
+def _normalize_brats2024_cases(root: Path, case_extract_root: Path) -> List[Path]:
+    """Normalise a BraTS 2024 GLI extraction root into standard per-case directories.
+
+    For each case in root/data/, copies the matching seg file from root/labels/
+    into the case directory. Returns the list of normalised case directories.
+
+    After this step every case directory contains all 5 files (4 modalities + seg)
+    and the rest of the pipeline is format-agnostic.
+    """
+    data_dir   = root / "data"
+    labels_dir = root / "labels"
+    case_dirs: List[Path] = []
+
+    for case_dir in sorted(data_dir.iterdir()):
+        if not case_dir.is_dir():
+            continue
+
+        # Destination in our cache, mirrored from the data/ subdir
+        dest_dir = case_extract_root / case_dir.name
+        dest_dir.mkdir(parents=True, exist_ok=True)
+
+        # Copy modality files if not already there
+        for nii_file in case_dir.glob("*.nii.gz"):
+            dest_file = dest_dir / nii_file.name
+            if not dest_file.exists():
+                shutil.copy2(nii_file, dest_file)
+
+        # Find and copy the matching seg file from labels/
+        # Seg filename pattern: <case_id>-seg.nii.gz
+        seg_src = labels_dir / f"{case_dir.name}-seg.nii.gz"
+        if seg_src.exists():
+            dest_seg = dest_dir / seg_src.name
+            if not dest_seg.exists():
+                shutil.copy2(seg_src, dest_seg)
+        else:
+            print(f"  [warn] No seg file found for {case_dir.name}, skipping.")
+            continue
+
+        case_dirs.append(dest_dir)
+
+    return case_dirs
 
 
 def extract_case_from_tar(
@@ -37,47 +104,90 @@ def extract_case_from_tar(
     extract_root: str | Path = ".cache/brats",
     force: bool = False,
 ) -> Path:
-    """Extract a BraTS .tar archive to a local cache directory.
+    """Extract a BraTS 2021-style single-case .tar archive.
 
-    Skips extraction if the target directory already contains .nii.gz files
-    (unless force=True), so we don't re-extract on every run.
+    Skips re-extraction if the target directory already has .nii.gz files.
+    Returns the case directory.
     """
-    tar_path = Path(tar_path)
+    tar_path     = Path(tar_path)
     extract_root = Path(extract_root)
-    case_root = extract_root / tar_path.stem
+    case_root    = extract_root / tar_path.stem
     case_root.mkdir(parents=True, exist_ok=True)
 
-    # Skip if already extracted — avoids re-doing slow I/O on every run
-    existing_nii = list(case_root.glob("*.nii.gz"))
-    if existing_nii and not force:
+    # Skip if already extracted
+    if list(case_root.glob("*.nii.gz")) and not force:
         return case_root
 
     with tarfile.open(tar_path, "r:*") as archive:
         archive.extractall(case_root)
 
-    nested = list(case_root.glob("**/*.nii.gz"))
-    if not nested:
+    if not list(case_root.glob("**/*.nii.gz")):
         raise FileNotFoundError(f"No NIfTI files found after extracting {tar_path}")
     return case_root
 
 
-def case_id_from_path(case_path: str | Path) -> str:
-    """Extract a human-readable case ID from either a .tar path or a directory.
+def extract_brats2024_archive(
+    tar_path: str | Path,
+    extract_root: str | Path = ".cache/brats",
+    force: bool = False,
+) -> List[Path]:
+    """Extract a BraTS 2024 GLI multi-case .tar.gz archive.
 
-    Example: 'BraTS2021_00495.tar' -> 'BraTS2021_00495'
+    Extracts to a staging area, detects the data/labels structure, normalises
+    each case (copies seg into its case dir), and returns a list of case dirs.
     """
+    tar_path     = Path(tar_path)
+    extract_root = Path(extract_root)
+
+    # Staging dir: strip all suffixes (.tar.gz → just the base stem)
+    stem = tar_path.name
+    for suffix in (".tar.gz", ".tgz", ".tar"):
+        if stem.endswith(suffix):
+            stem = stem[: -len(suffix)]
+            break
+    staging_dir = extract_root / f"{stem}_staging"
+
+    # Only re-extract if forced or staging dir is empty
+    if not staging_dir.exists() or force:
+        staging_dir.mkdir(parents=True, exist_ok=True)
+        with tarfile.open(tar_path, "r:*") as archive:
+            archive.extractall(staging_dir)
+
+    # Detect BraTS 2024 root (may be nested one level deep)
+    brats2024_root: Path | None = None
+    if _is_brats2024_root(staging_dir):
+        brats2024_root = staging_dir
+    else:
+        for subdir in staging_dir.iterdir():
+            if subdir.is_dir() and _is_brats2024_root(subdir):
+                brats2024_root = subdir
+                break
+
+    if brats2024_root is None:
+        raise ValueError(
+            f"{tar_path} does not appear to be a BraTS 2024 GLI archive "
+            f"(expected data/ and labels/ subdirectories)."
+        )
+
+    case_extract_root = extract_root / stem
+    case_extract_root.mkdir(parents=True, exist_ok=True)
+    return _normalize_brats2024_cases(brats2024_root, case_extract_root)
+
+
+# ---------------------------------------------------------------------------
+# Case discovery
+# ---------------------------------------------------------------------------
+
+def case_id_from_path(case_path: str | Path) -> str:
+    """Extract a human-readable case ID from a path."""
     case_path = Path(case_path)
     if case_path.is_file():
-        return case_path.stem   # filename without extension
-    return case_path.name       # directory name
+        return case_path.stem
+    return case_path.name
 
 
 def _find_by_alias(files: Iterable[Path], aliases: Iterable[str]) -> Path:
-    """Find the first file whose name matches any of the given suffix aliases.
-
-    Used to locate each modality file regardless of naming convention.
-    Raises FileNotFoundError if none of the aliases match.
-    """
+    """Find the first file whose lowercase name ends with any of the given aliases."""
     lower_to_file = {f.name.lower(): f for f in files}
     for name, path in lower_to_file.items():
         for suffix in aliases:
@@ -87,66 +197,84 @@ def _find_by_alias(files: Iterable[Path], aliases: Iterable[str]) -> Path:
 
 
 def _dir_has_required_modalities(case_dir: Path) -> bool:
-    """Check that a directory contains all 5 required BraTS files (4 modalities + seg mask).
-
-    Used to distinguish real BraTS case directories from unrelated folders.
-    """
-    nii_files = [p for p in case_dir.glob("*.nii.gz")]
+    """Return True if case_dir contains all 5 required BraTS NIfTI files."""
+    nii_files = list(case_dir.glob("*.nii.gz"))
     if not nii_files:
         return False
-
     names = [p.name.lower() for p in nii_files]
     for aliases in MODALITY_ALIASES.values():
-        if not any(any(name.endswith(suffix) for suffix in aliases) for name in names):
+        if not any(any(name.endswith(s) for s in aliases) for name in names):
             return False
     return True
 
 
 def discover_case_paths(input_path: str | Path, max_cases: int = 0) -> List[Path]:
-    """Find all BraTS cases (as .tar files or case directories) under input_path.
+    """Find all BraTS cases under input_path. Supports both BraTS 2021 and 2024.
 
-    Supports three input types:
-    - A single .tar file: returns just that file
-    - A directory with .tar files: returns all .tar archives found recursively
-    - A directory of extracted case dirs: returns all directories with required modalities
+    Handles:
+    - A single .tar file (BraTS 2021, one case)
+    - A single .tar.gz file (BraTS 2024 GLI, multiple cases)
+    - A directory containing .tar / .tar.gz archives
+    - A directory of already-extracted case directories
 
-    max_cases: limit the number of returned cases (0 = no limit)
+    Returns a deduplicated list of per-case directories ready for loading.
     """
     input_path = Path(input_path)
     if not input_path.exists():
         raise FileNotFoundError(f"Input path does not exist: {input_path}")
 
     cases: List[Path] = []
+
     if input_path.is_file():
-        # Single file provided directly
-        cases = [input_path]
+        # Single archive provided directly
+        if input_path.suffix in (".gz",) or input_path.name.endswith(".tar.gz"):
+            # BraTS 2024 GLI multi-case archive
+            cases.extend(extract_brats2024_archive(input_path))
+        else:
+            # BraTS 2021 single-case .tar
+            cases.append(input_path)
     else:
-        # Check if the directory itself is a case (e.g., already extracted)
+        # Directory: check if it's already an extracted case
         if _dir_has_required_modalities(input_path):
             cases.append(input_path)
 
-        # Find all .tar archives (skip hidden directories like .cache)
+        # Find all .tar archives (BraTS 2021 style, one case each)
         tar_paths = sorted(
-            p for p in input_path.rglob("*.tar") if not any(part.startswith(".") for part in p.parts)
+            p for p in input_path.rglob("*.tar")
+            if not p.name.endswith(".tar.gz")
+            and not any(part.startswith(".") for part in p.parts)
         )
         cases.extend(tar_paths)
 
-        # Find all subdirectories that look like BraTS cases
+        # Find all .tar.gz archives (BraTS 2024 style, multi-case)
+        tar_gz_paths = sorted(
+            p for p in input_path.rglob("*.tar.gz")
+            if not any(part.startswith(".") for part in p.parts)
+        )
+        for tgz in tar_gz_paths:
+            try:
+                extracted = extract_brats2024_archive(tgz)
+                cases.extend(extracted)
+            except ValueError as e:
+                print(f"  [warn] Skipping {tgz.name}: {e}")
+
+        # Find already-extracted case directories
         case_dirs = sorted(
-            p
-            for p in input_path.rglob("*")
-            if p.is_dir() and not any(part.startswith(".") for part in p.parts) and _dir_has_required_modalities(p)
+            p for p in input_path.rglob("*")
+            if p.is_dir()
+            and not any(part.startswith(".") for part in p.parts)
+            and _dir_has_required_modalities(p)
         )
         cases.extend(case_dirs)
 
-    # Deduplicate by case ID (e.g., avoid listing both the .tar and its extracted directory)
+    # Deduplicate by case ID
     unique: List[Path] = []
-    seen_case_ids = set()
+    seen: set[str] = set()
     for case in cases:
         cid = case_id_from_path(case).lower()
-        if cid not in seen_case_ids:
+        if cid not in seen:
             unique.append(case)
-            seen_case_ids.add(cid)
+            seen.add(cid)
 
     if max_cases and max_cases > 0:
         unique = unique[:max_cases]
@@ -157,10 +285,12 @@ def discover_case_paths(input_path: str | Path, max_cases: int = 0) -> List[Path
 
 
 def resolve_case_dir(case_path: str | Path) -> Path:
-    """Resolve a case path to an actual directory containing .nii.gz files.
+    """Resolve a case path to a directory containing .nii.gz files.
 
-    If the path is a .tar file, it extracts it first.
-    If it's already a directory, it returns it directly.
+    For a BraTS 2021 .tar file: extracts it and returns the case directory.
+    For an already-extracted directory: returns it directly.
+    Note: BraTS 2024 .tar.gz files are handled in discover_case_paths;
+    by the time resolve_case_dir is called, they are already extracted.
     """
     case_path = Path(case_path)
     if case_path.is_file() and case_path.suffix == ".tar":
@@ -170,45 +300,43 @@ def resolve_case_dir(case_path: str | Path) -> Path:
     raise FileNotFoundError(f"Case path does not exist or unsupported type: {case_path}")
 
 
+# ---------------------------------------------------------------------------
+# Volume loading and preprocessing
+# ---------------------------------------------------------------------------
+
 def load_case_volumes(case_path: str | Path) -> Dict[str, np.ndarray]:
-    """Load all 5 NIfTI volumes for a BraTS case into memory as numpy arrays.
+    """Load all 5 NIfTI volumes for a BraTS case into memory.
 
-    Returns a dict with keys: 't1', 't1ce', 't2', 'flair', 'seg'
-    Each array has shape (240, 240, 155) — the standard BraTS volume shape.
-
-    Validates that all modalities have the same shape (sanity check).
+    Works for both BraTS 2021 and 2024 cases (after normalisation).
+    Returns a dict: {'t1', 't1ce', 't2', 'flair', 'seg'} → (H, W, D) float32 arrays.
     """
-    case_dir = resolve_case_dir(case_path)
-    nii_files = [p for p in case_dir.rglob("*.nii.gz")]
+    case_dir  = resolve_case_dir(case_path)
+    nii_files = list(case_dir.rglob("*.nii.gz"))
     if not nii_files:
         raise FileNotFoundError(f"No .nii.gz files found in {case_dir}")
 
     volumes: Dict[str, np.ndarray] = {}
     for key, aliases in MODALITY_ALIASES.items():
-        file_path = _find_by_alias(nii_files, aliases)
-        # nib.load reads the file; .get_fdata() returns the voxel data as float64
-        # We cast to float32 to halve memory usage with no meaningful precision loss
-        volumes[key] = nib.load(str(file_path)).get_fdata().astype(np.float32)
+        file_path      = _find_by_alias(nii_files, aliases)
+        volumes[key]   = nib.load(str(file_path)).get_fdata().astype(np.float32)
 
-    # All modalities should have the same spatial shape — catch mismatches early
+    # Sanity check: all modalities must have the same spatial shape
     shape = volumes["seg"].shape
-    for key, volume in volumes.items():
-        if volume.shape != shape:
-            raise ValueError(f"Shape mismatch: {key} has {volume.shape}, expected {shape}")
+    for key, vol in volumes.items():
+        if vol.shape != shape:
+            raise ValueError(f"Shape mismatch: {key} has {vol.shape}, expected {shape}")
 
     return volumes
 
 
 def normalize_zscore(volume: np.ndarray, eps: float = 1e-8) -> np.ndarray:
-    """Apply z-score normalization: subtract mean, divide by std.
+    """Z-score normalise a volume: subtract mean, divide by std.
 
-    Result: zero mean, unit variance (approximately).
-    eps prevents division by zero for constant-valued regions (e.g., skull-stripped background).
-    Applied per modality per volume — NOT globally across patients —
-    because MRI intensities are not calibrated across scanners.
+    Applied per modality per volume (not globally) because MRI intensities
+    are not calibrated across scanners or acquisition protocols.
     """
     mean = float(np.mean(volume))
-    std = float(np.std(volume))
+    std  = float(np.std(volume))
     return ((volume - mean) / (std + eps)).astype(np.float32)
 
 
@@ -216,48 +344,40 @@ def normalize_modalities(
     volumes: Dict[str, np.ndarray],
     keys: Tuple[str, ...] = ("t1", "t1ce", "t2", "flair"),
 ) -> Dict[str, np.ndarray]:
-    """Apply z-score normalization to each MRI modality independently.
+    """Apply z-score normalisation to each MRI modality independently.
 
-    We normalize T1, T1ce, T2, FLAIR but NOT the segmentation mask
-    (seg contains integer labels 0/1/2/4, not intensity values).
+    The segmentation mask is left untouched (it contains integer labels).
     """
-    normalized = dict(volumes)
+    normalised = dict(volumes)
     for key in keys:
-        normalized[key] = normalize_zscore(normalized[key])
-    return normalized
+        normalised[key] = normalize_zscore(normalised[key])
+    return normalised
 
 
 def to_binary_mask(seg: np.ndarray) -> np.ndarray:
-    """Convert BraTS multi-class segmentation labels to a single binary tumor mask.
+    """Convert multi-class BraTS labels to a single binary tumor mask.
 
-    BraTS 2021 label convention:
-      0 = background (healthy brain + non-brain)
-      1 = necrotic tumor core (NCR)
+    BraTS label convention (both 2021 and 2024):
+      0 = background
+      1 = necrotic core (NCR)
       2 = peritumoral edema (ED)
-      4 = enhancing tumor (ET)
+      3 or 4 = enhancing tumor (ET)   ← BraTS 2024 uses 3 instead of 4
 
-    We merge all tumor classes (1, 2, 4) into a single binary mask:
-      0 = no tumor, 1 = tumor (any subregion)
-
-    This simplifies the problem to binary segmentation: tumor vs. background.
+    All non-zero labels are merged into tumor class (1).
     """
     return (seg > 0).astype(np.float32)
 
 
 def find_tumor_slices(mask_3d: np.ndarray, min_tumor_pixels: int = 1) -> List[int]:
-    """Return the axial slice indices that contain at least min_tumor_pixels of tumor.
+    """Return axial slice indices that contain at least min_tumor_pixels of tumor.
 
-    BraTS volumes have 155 axial slices but many slices (especially at the top/bottom)
-    contain no tumor at all. Training on blank slices would severely unbalance the
-    dataset toward background. We filter them out here.
-
-    mask_3d shape: (H, W, D) — D = number of axial slices (155 for BraTS)
+    Filters out blank slices (no tumor) to avoid extreme class imbalance.
+    mask_3d shape: (H, W, D) where D is the number of axial slices.
     """
-    slices: List[int] = []
-    for idx in range(mask_3d.shape[-1]):
-        if int(np.sum(mask_3d[:, :, idx])) >= min_tumor_pixels:
-            slices.append(idx)
-    return slices
+    return [
+        idx for idx in range(mask_3d.shape[-1])
+        if int(np.sum(mask_3d[:, :, idx])) >= min_tumor_pixels
+    ]
 
 
 def build_slices(
@@ -268,48 +388,40 @@ def build_slices(
 ) -> Tuple[np.ndarray, np.ndarray] | Tuple[np.ndarray, np.ndarray, List[int]]:
     """Convert 3D volumes into a stack of 2D axial slices.
 
-    For each selected axial slice index, we:
-    1. Stack the 4 modality slices into a (4, H, W) tensor — the 4-channel input
-    2. Take the binary mask slice as (1, H, W) — the target
+    For each selected axial index:
+      - Stacks 4 modality slices → (4, H, W) input tensor
+      - Takes binary mask slice  → (1, H, W) target tensor
 
     Returns:
-        X: (N, 4, 240, 240) float32 — input images
-        y: (N, 1, 240, 240) float32 — binary tumor masks
-        (optional) slice_indices: list of axial slice indices that were selected
+        X: (N, 4, H, W) float32
+        y: (N, 1, H, W) float32
+        (optional) slice_indices: list of selected axial indices
     """
-    seg = to_binary_mask(volumes["seg"])
-    depth = seg.shape[-1]  # 155 axial slices in BraTS
+    seg   = to_binary_mask(volumes["seg"])
+    depth = seg.shape[-1]
 
-    if only_tumor:
-        # Keep only slices with at least 1 tumor pixel — avoids blank-slice imbalance
-        slice_indices = find_tumor_slices(seg, min_tumor_pixels=min_tumor_pixels)
-    else:
-        slice_indices = list(range(depth))
-
+    slice_indices = (
+        find_tumor_slices(seg, min_tumor_pixels=min_tumor_pixels)
+        if only_tumor else list(range(depth))
+    )
     if not slice_indices:
         raise ValueError("No slices selected. Check mask or min_tumor_pixels.")
 
-    x_slices = []
-    y_slices = []
+    x_slices, y_slices = [], []
     for idx in slice_indices:
-        # Stack the 4 modality channels for this axial slice: shape (4, 240, 240)
         image = np.stack(
-            [
-                volumes["t1"][:, :, idx],
-                volumes["t1ce"][:, :, idx],
-                volumes["t2"][:, :, idx],
-                volumes["flair"][:, :, idx],
-            ],
+            [volumes["t1"][:, :, idx],
+             volumes["t1ce"][:, :, idx],
+             volumes["t2"][:, :, idx],
+             volumes["flair"][:, :, idx]],
             axis=0,
-        ).astype(np.float32)
-        # Binary mask for this slice: shape (1, 240, 240) — channel dim needed by PyTorch
-        mask = seg[:, :, idx][None, :, :].astype(np.float32)
+        ).astype(np.float32)                          # (4, H, W)
+        mask = seg[:, :, idx][None, :, :].astype(np.float32)  # (1, H, W)
         x_slices.append(image)
         y_slices.append(mask)
 
-    # Stack all slices into batched arrays
-    X = np.stack(x_slices, axis=0).astype(np.float32)   # (N, 4, 240, 240)
-    y = np.stack(y_slices, axis=0).astype(np.float32)   # (N, 1, 240, 240)
+    X = np.stack(x_slices, axis=0).astype(np.float32)   # (N, 4, H, W)
+    y = np.stack(y_slices, axis=0).astype(np.float32)   # (N, 1, H, W)
 
     if return_indices:
         return X, y, slice_indices
@@ -323,23 +435,21 @@ def build_dataset_from_cases(
 ) -> Tuple[np.ndarray, np.ndarray, List[Dict[str, int | str]]]:
     """Load and concatenate 2D slice data from multiple BraTS cases.
 
-    Processes each case independently (normalize per-case), then concatenates
-    all slices into a single dataset. Returns a summary list for logging.
+    Each case is normalised independently (per-case z-score), then all
+    slices are concatenated into a single dataset array.
 
     Returns:
-        X_cat: (N_total, 4, 240, 240) — all slices from all cases
-        y_cat: (N_total, 1, 240, 240) — corresponding binary masks
-        summary: list of dicts with case_id, num_slices, num_tumor_slices per case
+        X_cat:   (N_total, 4, H, W) float32
+        y_cat:   (N_total, 1, H, W) float32
+        summary: per-case dict with case_id, num_slices, num_tumor_slices
     """
-    x_all: List[np.ndarray] = []
-    y_all: List[np.ndarray] = []
+    x_all:   List[np.ndarray] = []
+    y_all:   List[np.ndarray] = []
     summary: List[Dict[str, int | str]] = []
 
     for case in case_paths:
         case_id = case_id_from_path(case)
-        # Load raw volumes and apply per-modality z-score normalization
         volumes = normalize_modalities(load_case_volumes(case))
-        # Extract 2D slices; return_indices=True gives us the slice numbers for summary
         X, y, indices = build_slices(
             volumes,
             only_tumor=only_tumor,
@@ -348,18 +458,15 @@ def build_dataset_from_cases(
         )
         x_all.append(X)
         y_all.append(y)
-        summary.append(
-            {
-                "case_id": case_id,
-                "num_slices": int(X.shape[0]),
-                "num_tumor_slices": int(len(indices)),
-            }
-        )
+        summary.append({
+            "case_id":          case_id,
+            "num_slices":       int(X.shape[0]),
+            "num_tumor_slices": int(len(indices)),
+        })
 
     if not x_all:
         raise ValueError("No slices were built from the provided case paths.")
 
-    # Concatenate slices from all patients into one flat array
     X_cat = np.concatenate(x_all, axis=0).astype(np.float32)
     y_cat = np.concatenate(y_all, axis=0).astype(np.float32)
     return X_cat, y_cat, summary
