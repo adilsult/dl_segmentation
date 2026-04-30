@@ -2,7 +2,7 @@ from __future__ import annotations
 
 # data.py — BraTS data loading, normalization, and 2D slice extraction
 #
-# Supports two dataset formats:
+# Supports three dataset formats:
 #
 #   BraTS 2021 (.tar, one case per archive):
 #     BraTS2021_00495/
@@ -22,8 +22,18 @@ from __future__ import annotations
 #     labels/
 #       └── BraTS-GLI-00001-000-seg.nii.gz   ← mask in separate folder
 #
+#   BraTS 2020 HDF5 (Kaggle, pre-sliced .h5 files):
+#     data/
+#       ├── volume_1_slice_0.h5       ← one file per 2D slice
+#       ├── volume_1_slice_1.h5
+#       └── ...                       ← 369 volumes × 155 slices = 57,195 files
+#     Each .h5 file contains:
+#       image: (240, 240, 4) float64  ← already z-score normalised
+#       mask:  (240, 240, 3) uint8    ← 3 binary channels: necrosis / edema / enhancing
+#
 # The BraTS 2024 format is normalised on extraction: the seg file is copied
 # into each case directory so all downstream code stays format-agnostic.
+# The BraTS 2020 HDF5 format has its own loader (build_dataset_from_h5).
 #
 # Output shape: X = (N, 4, 240, 240), y = (N, 1, 240, 240)
 
@@ -466,6 +476,127 @@ def build_dataset_from_cases(
 
     if not x_all:
         raise ValueError("No slices were built from the provided case paths.")
+
+    X_cat = np.concatenate(x_all, axis=0).astype(np.float32)
+    y_cat = np.concatenate(y_all, axis=0).astype(np.float32)
+    return X_cat, y_cat, summary
+
+
+# ===========================================================================
+# BraTS 2020 HDF5 format (Kaggle)
+# ===========================================================================
+
+def is_h5_dataset_dir(path: str | Path) -> bool:
+    """Return True if the directory contains BraTS 2020-style .h5 slice files."""
+    return any(Path(path).glob("*.h5"))
+
+
+def discover_h5_volume_ids(data_dir: str | Path, max_cases: int = 0) -> List[str]:
+    """Return sorted list of unique volume IDs in a BraTS 2020 HDF5 directory.
+
+    Each volume corresponds to one patient.
+    File naming convention: volume_<ID>_slice_<N>.h5
+
+    max_cases: limit the number of returned volumes (0 = all).
+    """
+    data_dir = Path(data_dir)
+    volume_ids: set[str] = set()
+    for f in data_dir.glob("*.h5"):
+        # Extract volume ID: "volume_100_slice_50.h5" -> "volume_100"
+        parts = f.stem.split("_slice_")
+        if len(parts) == 2:
+            volume_ids.add(parts[0])
+    ids = sorted(volume_ids)
+    if max_cases and max_cases > 0:
+        ids = ids[:max_cases]
+    return ids
+
+
+def _load_h5_slice(h5_path: Path) -> Tuple[np.ndarray, np.ndarray]:
+    """Load a single BraTS 2020 HDF5 slice file.
+
+    Returns:
+        image: (4, 240, 240) float32 — 4 modalities, already z-score normalised
+        mask:  (1, 240, 240) float32 — binary tumor mask (any sub-region = 1)
+    """
+    import h5py
+    with h5py.File(h5_path, "r") as f:
+        # image is (H, W, 4) — transpose to (4, H, W) for PyTorch convention
+        image = f["image"][()].astype(np.float32)          # (H, W, 4)
+        image = np.transpose(image, (2, 0, 1))             # (4, H, W)
+
+        # mask is (H, W, 3) with 3 binary channels (necrosis, edema, enhancing)
+        # Merge all sub-regions into one binary tumor mask
+        mask_raw = f["mask"][()].astype(np.float32)        # (H, W, 3)
+        mask = (mask_raw.max(axis=-1, keepdims=True) > 0).astype(np.float32)
+        mask = np.transpose(mask, (2, 0, 1))               # (1, H, W)
+
+    return image, mask
+
+
+def build_dataset_from_h5(
+    data_dir: str | Path,
+    volume_ids: List[str],
+    only_tumor: bool = True,
+    min_tumor_pixels: int = 1,
+) -> Tuple[np.ndarray, np.ndarray, List[Dict[str, int | str]]]:
+    """Load BraTS 2020 HDF5 slices for given volume IDs.
+
+    The HDF5 dataset is already pre-processed (z-score normalised per volume),
+    so no additional normalisation is applied here.
+
+    Args:
+        data_dir:         directory containing .h5 slice files
+        volume_ids:       list of volume IDs to load (e.g. ['volume_1', 'volume_2'])
+        only_tumor:       if True, skip slices with no tumor pixels
+        min_tumor_pixels: minimum tumor pixels to keep a slice
+
+    Returns:
+        X:       (N, 4, 240, 240) float32
+        y:       (N, 1, 240, 240) float32
+        summary: list of per-volume dicts with case_id, num_slices, num_tumor_slices
+    """
+    data_dir = Path(data_dir)
+    x_all:   List[np.ndarray] = []
+    y_all:   List[np.ndarray] = []
+    summary: List[Dict[str, int | str]] = []
+
+    for vid in volume_ids:
+        # Collect and sort all slice files for this volume
+        slice_files = sorted(
+            data_dir.glob(f"{vid}_slice_*.h5"),
+            key=lambda p: int(p.stem.split("_slice_")[1]),
+        )
+        if not slice_files:
+            print(f"  [warn] No slices found for volume {vid}, skipping.")
+            continue
+
+        x_vol: List[np.ndarray] = []
+        y_vol: List[np.ndarray] = []
+
+        for sp in slice_files:
+            img, msk = _load_h5_slice(sp)
+            # Skip slices with no (or insufficient) tumor
+            if only_tumor and int(msk.sum()) < min_tumor_pixels:
+                continue
+            x_vol.append(img)
+            y_vol.append(msk)
+
+        if not x_vol:
+            continue  # volume has no tumor slices, skip entirely
+
+        X = np.stack(x_vol, axis=0).astype(np.float32)   # (N, 4, H, W)
+        y = np.stack(y_vol, axis=0).astype(np.float32)   # (N, 1, H, W)
+        x_all.append(X)
+        y_all.append(y)
+        summary.append({
+            "case_id":          vid,
+            "num_slices":       int(X.shape[0]),
+            "num_tumor_slices": int(X.shape[0]),
+        })
+
+    if not x_all:
+        raise ValueError("No slices were loaded from the HDF5 dataset.")
 
     X_cat = np.concatenate(x_all, axis=0).astype(np.float32)
     y_cat = np.concatenate(y_all, axis=0).astype(np.float32)

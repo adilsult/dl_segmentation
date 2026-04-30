@@ -22,7 +22,10 @@ from typing import Dict, List, Sequence
 import numpy as np
 import torch
 
-from data import build_dataset_from_cases, discover_case_paths
+from data import (
+    build_dataset_from_cases, discover_case_paths,
+    is_h5_dataset_dir, discover_h5_volume_ids, build_dataset_from_h5,
+)
 from dataset import BraTS2DSliceDataset, make_loaders
 from eval import evaluate
 from losses import DiceBCELoss, FocalTverskyLoss
@@ -110,58 +113,105 @@ def build_loss(args: argparse.Namespace) -> torch.nn.Module:
         raise ValueError(f"Unknown loss: {args.loss}")
 
 
+def _build_loaders_from_h5(args: argparse.Namespace, only_tumor: bool):
+    """Build train/val DataLoaders from BraTS 2020 HDF5 dataset (patient-level split)."""
+    case_path = Path(args.case_path)
+    all_vids  = discover_h5_volume_ids(case_path, max_cases=args.max_cases)
+    print(f"HDF5 mode: {len(all_vids)} volumes found in {case_path}")
+
+    if len(all_vids) < 2:
+        X, y, summary = build_dataset_from_h5(case_path, all_vids, only_tumor, args.min_tumor_pixels)
+        print(f"Single-volume mode: X={X.shape}")
+        train_loader, val_loader = make_loaders(X, y, batch_size=args.batch_size,
+                                                val_ratio=args.val_ratio, seed=args.seed)
+        return train_loader, val_loader
+
+    # Patient-level split: shuffle by volume ID
+    rng = random.Random(args.seed)
+    vids = list(all_vids)
+    rng.shuffle(vids)
+    n_val      = max(1, int(len(vids) * args.val_ratio))
+    train_vids = vids[:-n_val]
+    val_vids   = vids[-n_val:]
+    print(f"Patient split: {len(train_vids)} train / {len(val_vids)} val volumes")
+
+    X_train, y_train, train_summary = build_dataset_from_h5(
+        case_path, train_vids, only_tumor, args.min_tumor_pixels)
+    X_val,   y_val,   val_summary   = build_dataset_from_h5(
+        case_path, val_vids,   only_tumor, args.min_tumor_pixels)
+
+    print(f"Train: X={X_train.shape} | Val: X={X_val.shape}")
+    for s in train_summary + val_summary:
+        print(f"  {s['case_id']}: {s['num_slices']} tumor slices")
+
+    train_ds     = BraTS2DSliceDataset(X_train, y_train)
+    val_ds       = BraTS2DSliceDataset(X_val,   y_val)
+    train_loader = torch.utils.data.DataLoader(train_ds, batch_size=args.batch_size,
+                                               shuffle=True,  num_workers=0)
+    val_loader   = torch.utils.data.DataLoader(val_ds,   batch_size=args.batch_size,
+                                               shuffle=False, num_workers=0)
+    return train_loader, val_loader
+
+
 def run_training(args: argparse.Namespace) -> Dict[str, List[float]]:
     set_seed(args.seed)
     device  = "cuda" if torch.cuda.is_available() and not args.cpu else "cpu"
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    case_paths = discover_case_paths(args.case_path, max_cases=args.max_cases)
-    print(f"Discovered cases: {len(case_paths)}")
-    for path in case_paths:
-        print(f"  - {path}")
-
     only_tumor = not args.include_empty_slices
 
-    if len(case_paths) == 1:
-        # Single patient — fall back to slice-level split (no choice)
-        X, y, summary = build_dataset_from_cases(
-            case_paths, only_tumor=only_tumor, min_tumor_pixels=args.min_tumor_pixels,
-        )
-        print(f"Single-case mode. Loaded slices: X={X.shape}, y={y.shape}")
-        print(f"Case summary: {summary}")
-        train_loader, val_loader = make_loaders(
-            X, y, batch_size=args.batch_size, val_ratio=args.val_ratio,
-            seed=args.seed, num_workers=0,
-        )
+    # ── Auto-detect dataset format ────────────────────────────────────────────
+    case_path = Path(args.case_path)
+    if case_path.is_dir() and is_h5_dataset_dir(case_path):
+        print(f"Detected BraTS 2020 HDF5 format: {case_path}")
+        train_loader, val_loader = _build_loaders_from_h5(args, only_tumor)
     else:
-        # Multiple patients — use patient-level split to avoid leakage
-        train_cases, val_cases = split_case_paths(case_paths, args.val_ratio, args.seed)
-        print(f"Patient split: train_cases={len(train_cases)}, val_cases={len(val_cases)}")
+        # NIfTI format: BraTS 2021 (.tar) or BraTS 2024 (.tar.gz)
+        case_paths = discover_case_paths(args.case_path, max_cases=args.max_cases)
+        print(f"Detected NIfTI format. Discovered cases: {len(case_paths)}")
+        for path in case_paths:
+            print(f"  - {path}")
 
-        X_train, y_train, train_summary = build_dataset_from_cases(
-            train_cases, only_tumor=only_tumor, min_tumor_pixels=args.min_tumor_pixels,
-        )
-        print(f"Train slices: X={X_train.shape}, y={y_train.shape}")
-        print(f"Train summary: {train_summary}")
-
-        train_ds     = BraTS2DSliceDataset(X_train, y_train)
-        train_loader = torch.utils.data.DataLoader(
-            train_ds, batch_size=args.batch_size, shuffle=True, num_workers=0
-        )
-
-        if val_cases:
-            X_val, y_val, val_summary = build_dataset_from_cases(
-                val_cases, only_tumor=only_tumor, min_tumor_pixels=args.min_tumor_pixels,
+        if len(case_paths) == 1:
+            # Single patient — slice-level split
+            X, y, summary = build_dataset_from_cases(
+                case_paths, only_tumor=only_tumor, min_tumor_pixels=args.min_tumor_pixels,
             )
-            print(f"Val slices: X={X_val.shape}, y={y_val.shape}")
-            print(f"Val summary: {val_summary}")
-            val_ds     = BraTS2DSliceDataset(X_val, y_val)
-            val_loader = torch.utils.data.DataLoader(
-                val_ds, batch_size=args.batch_size, shuffle=False, num_workers=0
+            print(f"Single-case mode. Loaded slices: X={X.shape}, y={y.shape}")
+            print(f"Case summary: {summary}")
+            train_loader, val_loader = make_loaders(
+                X, y, batch_size=args.batch_size, val_ratio=args.val_ratio,
+                seed=args.seed, num_workers=0,
             )
         else:
-            val_loader = None
+            # Multiple patients — patient-level split
+            train_cases, val_cases = split_case_paths(case_paths, args.val_ratio, args.seed)
+            print(f"Patient split: train_cases={len(train_cases)}, val_cases={len(val_cases)}")
+
+            X_train, y_train, train_summary = build_dataset_from_cases(
+                train_cases, only_tumor=only_tumor, min_tumor_pixels=args.min_tumor_pixels,
+            )
+            print(f"Train slices: X={X_train.shape}, y={y_train.shape}")
+            print(f"Train summary: {train_summary}")
+
+            train_ds     = BraTS2DSliceDataset(X_train, y_train)
+            train_loader = torch.utils.data.DataLoader(
+                train_ds, batch_size=args.batch_size, shuffle=True, num_workers=0
+            )
+
+            if val_cases:
+                X_val, y_val, val_summary = build_dataset_from_cases(
+                    val_cases, only_tumor=only_tumor, min_tumor_pixels=args.min_tumor_pixels,
+                )
+                print(f"Val slices: X={X_val.shape}, y={y_val.shape}")
+                print(f"Val summary: {val_summary}")
+                val_ds     = BraTS2DSliceDataset(X_val, y_val)
+                val_loader = torch.utils.data.DataLoader(
+                    val_ds, batch_size=args.batch_size, shuffle=False, num_workers=0
+                )
+            else:
+                val_loader = None
 
     # Optional: overfit on a tiny subset to verify the training loop works
     if args.tiny_overfit_samples > 0:
