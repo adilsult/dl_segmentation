@@ -288,8 +288,9 @@ def run_training(args: argparse.Namespace) -> Dict[str, List[float]]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train 2D binary U-Net baseline for BraTS slices.")
-    parser.add_argument("--case-path", type=str, default="BraTS2021_00495.tar",
-                        help="Path to one case .tar, one case directory, or a dataset directory.")
+    parser.add_argument("--case-path", type=str,
+                        default="BraTS2020_training_data/content/data",
+                        help="Path to BraTS2020 HDF5 dir, a .tar case, or a dataset directory.")
     parser.add_argument("--output-dir", type=str, default="runs/baseline_2d")
     parser.add_argument("--epochs",      type=int,   default=2)
     parser.add_argument("--batch-size",  type=int,   default=4)
